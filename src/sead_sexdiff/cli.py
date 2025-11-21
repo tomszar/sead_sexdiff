@@ -88,6 +88,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Local destination root directory (default: %(default)s)",
     )
+    dl.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable progress bar with percentage and ETA during downloads",
+    )
     return parser
 
 
@@ -104,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
             suffixes=suffixes,
             files=files,
             dest_root=args.dest_root,
+            show_progress=not args.no_progress,
         )
         for p in paths:
             print(p)

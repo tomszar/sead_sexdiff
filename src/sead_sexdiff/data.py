@@ -24,6 +24,8 @@ Notes
 
 from __future__ import annotations
 
+import sys
+import time
 from pathlib import Path
 from typing import Iterable, List
 
@@ -67,6 +69,7 @@ def download_data(
     suffixes: Iterable[str] | None = (".csv", ".html"),
     files: Iterable[str] | None = None,
     dest_root: str | Path = "data",
+    show_progress: bool = True,
 ) -> List[Path]:
     """Download public SEA-AD data from S3 via boto3.
 
@@ -119,47 +122,138 @@ def download_data(
 
     downloaded: List[Path] = []
 
-    # Always attempt to download Changelog.html in the given prefix
+    # Internal progress tracker
+    class _Progress:
+        def __init__(self, total: int | None):
+            self.total = total if (isinstance(total, int) and total > 0) else None
+            self.seen = 0
+            self.start = time.time()
+            self._last_print = 0.0
+
+        def cb(self, bytes_amount: int):
+            # Callback invoked by boto3 on each chunk
+            self.seen += int(bytes_amount)
+            if not show_progress:
+                return
+            now = time.time()
+            # Throttle updates to ~10 Hz
+            if now - self._last_print < 0.1:
+                return
+            self._last_print = now
+            self._print_line(end="\r")
+
+        def _eta_str(self, rate: float) -> str:
+            if rate <= 0:
+                return "--:--"
+            remaining = (self.total - self.seen) / rate if self.total else 0
+            m, s = divmod(int(max(0, remaining)), 60)
+            if m >= 60:
+                h, m = divmod(m, 60)
+                return f"{h:d}h{m:02d}m"
+            return f"{m:02d}:{s:02d}"
+
+        def _human(self, n: int) -> str:
+            # Simple human-readable bytes
+            units = ["B", "KB", "MB", "GB", "TB"]
+            size = float(n)
+            for u in units:
+                if size < 1024 or u == units[-1]:
+                    return f"{size:.1f}{u}"
+                size /= 1024
+            return f"{n}B"
+
+        def _print_line(self, end: str = "\n"):
+            elapsed = max(1e-6, time.time() - self.start)
+            rate = self.seen / elapsed
+            rate_str = self._human(int(rate)) + "/s"
+            if self.total:
+                pct = (self.seen / self.total) * 100
+                eta = self._eta_str(rate)
+                line = (
+                    f"Downloading: {self._human(self.seen)} / {self._human(self.total)} "
+                    f"({pct:5.1f}%) | ETA {eta} | {rate_str}"
+                )
+            else:
+                line = f"Downloading: {self._human(self.seen)} | {rate_str}"
+            sys.stdout.write(line + end)
+            sys.stdout.flush()
+
+        def finish(self):
+            if show_progress:
+                # Ensure a final full line with 100% if total known
+                if self.total:
+                    self.seen = max(self.seen, self.total)
+                self._print_line(end="\n")
+
+    # Build a queue of downloads with known sizes when possible
+    download_queue: list[tuple[str, Path, int | None]] = []  # (key, local_path, size)
+
+    # Always consider Changelog.html
     changelog_key = f"{prefix}Changelog.html"
     try:
         local_changelog = dest_root / changelog_key
-        _ensure_parent_dir(local_changelog)
-        s3.download_file(bucket, changelog_key, str(local_changelog))
-        downloaded.append(local_changelog)
+        remote_size: int | None = None
+        try:
+            head = s3.head_object(Bucket=bucket, Key=changelog_key)
+            remote_size = int(head.get("ContentLength", -1))
+            if remote_size < 0:
+                remote_size = None
+        except Exception:
+            remote_size = None
+
+        # Skip if up-to-date
+        try:
+            if local_changelog.exists() and remote_size is not None:
+                if local_changelog.stat().st_size == remote_size:
+                    pass  # do not enqueue
+                else:
+                    download_queue.append((changelog_key, local_changelog, remote_size))
+            else:
+                download_queue.append((changelog_key, local_changelog, remote_size))
+        except Exception:
+            download_queue.append((changelog_key, local_changelog, remote_size))
     except Exception:
-        # Non-fatal if not present or any transient error
+        # ignore issues with changelog discovery
         pass
 
-    # If specific files are requested, download those and return early
+    # If specific files are requested, prepare those and process early return
     if files:
         for f in files:
             if not f:
                 continue
-            # Normalize input to an S3 key under the prefix
             rel = str(f).lstrip("/")
             key = rel if rel.startswith(prefix) else f"{prefix}{rel}"
-
             local_path = dest_root / key
-            # Attempt to skip re-download when sizes match by peeking head
-            try:
-                if local_path.exists():
-                    try:
-                        head = s3.head_object(Bucket=bucket, Key=key)
-                        remote_size = int(head.get("ContentLength", -1))
-                        if remote_size > -1 and local_path.stat().st_size == remote_size:
-                            # already up-to-date
-                            continue
-                    except Exception:
-                        # If HEAD fails for any reason, fall back to download
-                        pass
 
+            remote_size: int | None = None
+            try:
+                head = s3.head_object(Bucket=bucket, Key=key)
+                rs = int(head.get("ContentLength", -1))
+                remote_size = rs if rs >= 0 else None
+            except Exception:
+                remote_size = None
+
+            # Skip re-download if size matches
+            try:
+                if local_path.exists() and remote_size is not None:
+                    if local_path.stat().st_size == remote_size:
+                        continue
+            except Exception:
+                pass
+
+            download_queue.append((key, local_path, remote_size))
+
+        # Execute downloads with progress
+        total_bytes = sum(sz for _, _, sz in download_queue if isinstance(sz, int)) or None
+        prog = _Progress(total_bytes)
+        for key, local_path, _sz in download_queue:
+            try:
                 _ensure_parent_dir(local_path)
-                s3.download_file(bucket, key, str(local_path))
+                s3.download_file(bucket, key, str(local_path), Callback=prog.cb)
                 downloaded.append(local_path)
             except Exception:
-                # Non-fatal; skip missing or inaccessible keys
                 continue
-
+        prog.finish()
         return downloaded
 
     # List all objects under the prefix and download those matching the suffixes
@@ -175,21 +269,27 @@ def download_data(
             if not _matches_suffixes(key, suffixes):
                 continue
             local_path = dest_root / key
-            # Skip re-download if file exists and size matches
+            # Decide whether to download and capture size
+            remote_size = obj.get("Size")
             try:
-                if local_path.exists():
-                    # Compare sizes when available
-                    local_size = local_path.stat().st_size
-                    remote_size = obj.get("Size")
-                    if isinstance(remote_size, int) and remote_size == local_size:
+                if local_path.exists() and isinstance(remote_size, int):
+                    if local_path.stat().st_size == remote_size:
                         continue
             except OSError:
-                # If any filesystem error occurs, attempt to re-download
                 pass
+            download_queue.append((key, local_path, remote_size if isinstance(remote_size, int) else None))
 
+    # Execute queued downloads with progress
+    total_bytes = sum(sz for _, _, sz in download_queue if isinstance(sz, int)) or None
+    prog = _Progress(total_bytes)
+    for key, local_path, _sz in download_queue:
+        try:
             _ensure_parent_dir(local_path)
-            s3.download_file(bucket, key, str(local_path))
+            s3.download_file(bucket, key, str(local_path), Callback=prog.cb)
             downloaded.append(local_path)
+        except Exception:
+            continue
+    prog.finish()
 
     return downloaded
 
