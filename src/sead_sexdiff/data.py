@@ -27,11 +27,13 @@ from __future__ import annotations
 import sys
 import time
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Any, Tuple
 
 import boto3
 from botocore import UNSIGNED
 from botocore.client import Config
+import h5py
+import pandas as pd
 
 
 DEFAULT_BUCKET = "sea-ad-single-cell-profiling"
@@ -294,4 +296,140 @@ def download_data(
     return downloaded
 
 
-__all__ = ["download_data"]
+def custom_read_h5ad(filename):
+    """Lightweight reader for a subset of .h5ad (AnnData) metadata.
+
+    This function reads only the metadata tables from an AnnData ``.h5ad`` file
+    without requiring the heavy anndata dependency. Specifically, it extracts
+    the ``obs`` (observations/cell metadata) and ``var`` (variables/gene
+    metadata) tables along with their index names (``obs_names`` and
+    ``var_names``).
+
+    It supports common storage layouts used by AnnData:
+    - Structured HDF5 datasets where ``obs``/``var`` are compound dtypes
+      (record arrays) with named fields.
+    - Group-based layouts where columns are stored as individual datasets under
+      ``obs``/``var`` and the index is stored in ``_index`` (or a column named
+      ``_index``/``index``).
+
+    Parameters
+    ----------
+    filename : str | pathlib.Path
+        Path to the ``.h5ad`` file.
+
+    Returns
+    -------
+    dict
+        A dictionary with the following keys:
+        - ``obs``: pandas.DataFrame of observation metadata
+        - ``var``: pandas.DataFrame of variable metadata
+        - ``obs_names``: pandas.Index of observation names
+        - ``var_names``: pandas.Index of variable names
+
+    Notes
+    -----
+    - If you need the full AnnData object, prefer using ``anndata.read_h5ad``.
+    - This reader avoids loading the expression matrix (``X``/``layers``) and
+      thus is fast and memory-light for metadata exploration.
+    - Byte string columns are decoded to UTF-8 where applicable.
+    """
+
+    def _decode_array(arr: Any) -> Any:
+        import numpy as np
+
+        if isinstance(arr, (bytes, bytearray)):
+            return arr.decode("utf-8")
+        if hasattr(arr, "dtype") and arr.dtype.kind in {"S", "O"}:
+            # Attempt elementwise decode for byte strings
+            def _dec(x: Any) -> Any:
+                if isinstance(x, (bytes, bytearray)):
+                    try:
+                        return x.decode("utf-8")
+                    except Exception:
+                        return x
+                return x
+
+            return np.vectorize(_dec, otypes=[object])(arr)
+        return arr
+
+    def _read_table(hf: h5py.File, key: str) -> Tuple[pd.DataFrame, pd.Index]:
+        if key not in hf:
+            # Return empty structures if missing
+            return pd.DataFrame(), pd.Index([], name=None)
+
+        node = hf[key]
+
+        # Case 1: structured dataset
+        if isinstance(node, h5py.Dataset):
+            data = node[()]
+            # If compound dtype with named fields
+            if getattr(data.dtype, "names", None):
+                columns = list(data.dtype.names)
+                # Build dict of columns
+                col_data = {c: _decode_array(data[c]) for c in columns}
+                df = pd.DataFrame(col_data)
+                # Determine index
+                idx = None
+                for cand in ("_index", "index"):
+                    if cand in df.columns:
+                        idx = pd.Index(df.pop(cand))
+                        break
+                if idx is None:
+                    # Try sibling dataset _index if exists
+                    idx_ds_name = f"{key}/_index"
+                    if idx_ds_name in hf:
+                        idx = pd.Index(_decode_array(hf[idx_ds_name][()]))
+                if idx is None:
+                    # fallback to first column if looks like names
+                    if len(df.columns) > 0:
+                        first = df.columns[0]
+                        idx = pd.Index(df.pop(first))
+                    else:
+                        idx = pd.RangeIndex(len(df))
+                return df, pd.Index(_decode_array(idx.values), name=idx.name)
+            else:
+                # 1D array with unknown semantics, treat as index-only
+                values = _decode_array(data)
+                return pd.DataFrame(), pd.Index(values)
+
+        # Case 2: group with per-column datasets
+        if isinstance(node, h5py.Group):
+            cols: dict[str, Any] = {}
+            index: pd.Index | None = None
+            # Read dedicated _index dataset if present
+            if "_index" in node:
+                index = pd.Index(_decode_array(node["_index"][()]))
+            # Gather datasets as columns
+            for name, ds in node.items():
+                if not isinstance(ds, h5py.Dataset):
+                    continue
+                if name.startswith("_"):
+                    # internal metadata
+                    continue
+                vals = _decode_array(ds[()])
+                cols[name] = vals
+            df = pd.DataFrame(cols)
+            if index is None:
+                for cand in ("_index", "index"):
+                    if cand in df.columns:
+                        index = pd.Index(df.pop(cand))
+                        break
+            if index is None:
+                index = pd.RangeIndex(len(df))
+            return df, pd.Index(_decode_array(index.values), name=index.name)
+
+        # Fallback empty
+        return pd.DataFrame(), pd.Index([], name=None)
+
+    with h5py.File(filename, "r") as hf:
+        obs_df, obs_names = _read_table(hf, "obs")
+        var_df, var_names = _read_table(hf, "var")
+
+    return {
+        "obs": obs_df,
+        "var": var_df,
+        "obs_names": obs_names,
+        "var_names": var_names,
+    }
+
+__all__ = ["download_data", "custom_read_h5ad"]
