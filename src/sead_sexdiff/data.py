@@ -104,9 +104,12 @@ def download_data(
 
     Notes
     -----
-    This function uses unsigned S3 requests, which is appropriate for public
-    buckets. If the bucket ever becomes private, authentication would be
-    required and this approach would need updating.
+    - To download all files under a folder/prefix (e.g. the donor_objects
+      folder), pass ``suffixes=None``. For example:
+      ``download_data(prefix="PFC/RNAseq/donor_objects/", suffixes=None)``.
+    - This function uses unsigned S3 requests, which is appropriate for public
+      buckets. If the bucket ever becomes private, authentication would be
+      required and this approach would need updating.
     """
 
     # Normalize inputs
@@ -294,4 +297,151 @@ def download_data(
     return downloaded
 
 
-__all__ = ["download_data"]
+def subset_adata(file_path: str | Path, *, subclass_label: str = "Microglia-PVM"):
+    """Read an AnnData H5AD file and return a subset by ``obs['Subclass']``.
+
+    Parameters
+    ----------
+    file_path:
+        Path to the ``.h5ad`` file to read.
+    subclass_label:
+        The label to match in ``adata.obs['Subclass']``. Defaults to
+        "Microglia-PVM".
+
+    Returns
+    -------
+    anndata.AnnData
+        The subset ``AnnData`` object. The original loaded object is deleted
+        to free memory before returning.
+    """
+    # Import locally to avoid heavy import on module import
+    import gc
+    import anndata as ad
+
+    file_path = Path(file_path)
+    adata = ad.read_h5ad(str(file_path))
+    if "Subclass" not in adata.obs:
+        try:
+            del adata
+        finally:
+            gc.collect()
+        raise KeyError("Column 'Subclass' not found in adata.obs")
+
+    subset = adata[adata.obs["Subclass"] == subclass_label].copy()
+    # Drop the original to free memory
+    try:
+        del adata
+    finally:
+        gc.collect()
+    return subset
+
+
+def subset_and_concat_folder(
+    folder: str | Path,
+    *,
+    subclass_label: str = "Microglia-PVM",
+    pattern: str = "*.h5ad",
+    recursive: bool = False,
+):
+    """Create a concatenated subset from all H5AD files in a folder.
+
+    Iterates through files, subsetting by ``Subclass == subclass_label`` for
+    each file, concatenating them into a single AnnData while aggressively
+    freeing intermediate objects to minimize memory usage.
+
+    Parameters
+    ----------
+    folder:
+        Directory containing input ``.h5ad`` files (e.g.
+        ``data/PFC/RNAseq/donor_objects``).
+    subclass_label:
+        Label to match in ``obs['Subclass']`` during subsetting.
+    pattern:
+        Glob pattern of files to include (default: ``*.h5ad``).
+    recursive:
+        If True, search subdirectories recursively using ``rglob``.
+
+    Returns
+    -------
+    anndata.AnnData
+        Concatenation of per-file subsets.
+    """
+    import gc
+    from typing import Iterable as _Iter
+    import anndata as ad
+
+    folder = Path(folder)
+    if not folder.exists():
+        raise FileNotFoundError(f"Folder not found: {folder}")
+
+    files: _Iter[Path]
+    files = folder.rglob(pattern) if recursive else folder.glob(pattern)
+    files = sorted([p for p in files if p.is_file()])
+    if not files:
+        raise FileNotFoundError(f"No files matching {pattern!r} in {folder}")
+
+    result: ad.AnnData | None = None
+    for fp in files:
+        subset = subset_adata(fp, subclass_label=subclass_label)
+        if result is None:
+            result = subset
+        else:
+            # Concatenate incrementally, then drop intermediates
+            new_result = ad.concat([result, subset], join="outer", merge="unique")
+            try:
+                del result
+                del subset
+            finally:
+                gc.collect()
+            result = new_result
+
+    assert result is not None  # for type checkers
+    return result
+
+
+def write_subset_from_folder(
+    folder: str | Path = "data/PFC/RNAseq/donor_objects",
+    *,
+    subclass_label: str = "Microglia-PVM",
+    out_dir: str | Path = "results/cleaned_files",
+    out_name: str = "microglia_subset.h5ad",
+    compression: str | None = "gzip",
+) -> Path:
+    """High-level helper: subset all files in ``folder`` and write one H5AD.
+
+    Parameters
+    ----------
+    folder:
+        Input folder with donor ``.h5ad`` objects.
+    subclass_label:
+        Subclass value used for filtering; defaults to "Microglia-PVM".
+    out_dir:
+        Output directory where the single concatenated file will be written.
+    out_name:
+        Filename for the output (default: "microglia_subset.h5ad").
+    compression:
+        Compression passed to ``AnnData.write`` (e.g., "gzip").
+
+    Returns
+    -------
+    pathlib.Path
+        The path to the written file.
+    """
+    import anndata as ad  # only for typing/IDE hints; actual write uses the object
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / out_name
+
+    adata_concat = subset_and_concat_folder(folder, subclass_label=subclass_label)
+    adata_concat.write(str(out_path), compression=compression)
+    return out_path
+
+
+__all__ = [
+    "DEFAULT_BUCKET",
+    "download_data",
+    "subset_adata",
+    "subset_and_concat_folder",
+    "write_subset_from_folder",
+]

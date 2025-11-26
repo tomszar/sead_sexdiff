@@ -1,6 +1,6 @@
 # sead_sexdiff
 
-Simple project scaffold using uv with Python >= 3.12 and latest pandas/numpy.
+Utilities and CLI for SEA-AD sex-difference analyses using Python >= 3.12. Includes tools to download data from the public SEA-AD S3 bucket and to subset/concatenate AnnData (.h5ad) donor files.
 
 Project layout:
 
@@ -34,7 +34,7 @@ source .venv/bin/activate  # or .venv\Scripts\activate on Windows
 uv pip install -e .
 ```
 
-This installs the latest compatible `pandas` and `numpy` as declared in `pyproject.toml`.
+This installs the project dependencies declared in `pyproject.toml` (e.g., `pandas`, `numpy`, `boto3/botocore`, `anndata`, `scanpy`).
 
 ### How to use
 
@@ -74,3 +74,75 @@ sead-sexdiff download --dest-root ./data --bucket sea-ad-single-cell-profiling
 ```
 
 The command prints the local paths of files it downloaded. It uses anonymous S3 access for the public SEA-AD bucket and always attempts to fetch `Changelog.html` under the chosen prefix.
+
+### New: Subset donor AnnData files and write a single output (CLI)
+
+Use the `subset` command to load each donor `.h5ad` in a folder, filter by a subclass label (default: `Microglia-PVM`), concatenate them, and write a single compressed `.h5ad` file.
+
+```
+sead-sexdiff subset \
+  --folder data/PFC/RNAseq/donor_objects \
+  --subclass-label Microglia-PVM \
+  --out-dir results/cleaned_files \
+  --out-name microglia_subset.h5ad \
+  --compression gzip
+```
+
+- Disable compression if desired: `sead-sexdiff subset --compression none`
+- Memory: files are processed one-by-one; intermediates are freed to keep memory usage low.
+
+### Python API examples
+
+In addition to the CLI, you can call the underlying functions from Python.
+
+- Download all files under a specific folder/prefix (e.g., `donor_objects`). Pass `suffixes=None` to download everything:
+
+```python
+from sead_sexdiff.data import download_data
+
+downloaded_paths = download_data(
+    prefix="PFC/RNAseq/donor_objects/",
+    suffixes=None,  # None => download all files under the prefix
+)
+```
+
+- Subset a single donor `.h5ad` by subclass and free the original object:
+
+```python
+from sead_sexdiff.data import subset_adata
+
+adata_sub = subset_adata(
+    "data/PFC/RNAseq/donor_objects/H19.33.004_SEAAD_A9_RNAseq_final-nuclei.2024-02-13.h5ad",
+    subclass_label="Microglia-PVM",
+)
+```
+
+- Subset every donor file in a folder and concatenate them:
+
+```python
+from sead_sexdiff.data import subset_and_concat_folder
+
+adata_concat = subset_and_concat_folder(
+    "data/PFC/RNAseq/donor_objects",
+    subclass_label="Microglia-PVM",
+)
+```
+
+- Build and write the concatenated subset to disk (gzip by default):
+
+```python
+from sead_sexdiff.data import write_subset_from_folder
+
+out_path = write_subset_from_folder(
+    folder="data/PFC/RNAseq/donor_objects",
+    subclass_label="Microglia-PVM",
+    out_dir="results/cleaned_files",
+    out_name="microglia_subset.h5ad",
+    compression="gzip",
+)
+print(out_path)
+```
+
+Notes
+- The subsetting functions expect an `obs['Subclass']` column in each AnnData object. An error is raised if it is missing.
+- To download “all files” under a prefix from Python, use `download_data(..., suffixes=None)`. The CLI `download` command defaults to CSV/HTML unless you specify particular suffixes or explicit `--file` values.

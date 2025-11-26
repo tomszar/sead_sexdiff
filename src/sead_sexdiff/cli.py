@@ -10,7 +10,7 @@ import argparse
 from pathlib import Path
 from typing import Iterable, List
 
-from .data import download_data, DEFAULT_BUCKET
+from .data import download_data, DEFAULT_BUCKET, write_subset_from_folder
 
 
 def _parse_suffixes(values: list[str] | None) -> list[str] | None:
@@ -93,6 +93,50 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable progress bar with percentage and ETA during downloads",
     )
+
+    # subset command: build a concatenated subset and write to disk
+    sub_subset = sub.add_parser(
+        "subset",
+        help="Subset donor .h5ad files by subclass and write a single output",
+        description=(
+            "Load each donor .h5ad in a folder, subset by obs['Subclass'] == label, "
+            "concatenate them, and write one compressed H5AD file."
+        ),
+    )
+    sub_subset.add_argument(
+        "--folder",
+        default="data/PFC/RNAseq/donor_objects",
+        type=Path,
+        help=(
+            "Input folder that contains donor .h5ad files (default: %(default)s)"
+        ),
+    )
+    sub_subset.add_argument(
+        "--subclass-label",
+        default="Microglia-PVM",
+        help=(
+            "Value to match in adata.obs['Subclass'] (default: %(default)s)"
+        ),
+    )
+    sub_subset.add_argument(
+        "--out-dir",
+        default="results/cleaned_files",
+        type=Path,
+        help="Directory to write the output file (default: %(default)s)",
+    )
+    sub_subset.add_argument(
+        "--out-name",
+        default="microglia_subset.h5ad",
+        help="Output filename (default: %(default)s)",
+    )
+    sub_subset.add_argument(
+        "--compression",
+        default="gzip",
+        help=(
+            "Compression for AnnData.write (e.g., gzip). Use 'none' to disable "
+            "compression. (default: %(default)s)"
+        ),
+    )
     return parser
 
 
@@ -113,6 +157,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         for p in paths:
             print(p)
+        return 0
+
+    if args.command == "subset":
+        compression = None if (str(args.compression).lower() in {"none", "no", "false", "0"}) else args.compression
+        out_path = write_subset_from_folder(
+            folder=args.folder,
+            subclass_label=args.subclass_label,
+            out_dir=args.out_dir,
+            out_name=args.out_name,
+            compression=compression,
+        )
+        print(out_path)
         return 0
 
     parser.error("Unknown command")
