@@ -34,6 +34,7 @@ from botocore import UNSIGNED
 from botocore.client import Config
 import h5py
 import pandas as pd
+import scanpy as sc
 
 
 DEFAULT_BUCKET = "sea-ad-single-cell-profiling"
@@ -577,10 +578,59 @@ def custom_read_h5ad(filename):
     }
 
 
+def prep_anndata(adata_, *, min_cells: int = 3, min_genes: int = 200):
+    """Prepare an AnnData object exported from R/Seurat for Scanpy workflows.
+
+    This helper fixes common conversion issues when moving between R and Python
+    and applies basic QC filtering:
+    - Ensure ``obs`` column dtypes are properly interpreted (e.g. byte strings
+      become UTF-8 strings) by reconstructing the object through a temporary
+      ``DataFrame`` merge.
+    - Filter out genes that are expressed in a small number of cells and cells
+      with too few detected genes.
+
+    Parameters
+    ----------
+    adata_ : anndata.AnnData
+        Input AnnData object. Typically created by reading a ``.h5ad`` that was
+        exported from R/Seurat or other pipelines where categorical/text columns
+        may arrive as bytes or mixed dtypes.
+    min_cells : int, default 3
+        Keep genes that are expressed in at least ``min_cells`` cells. Passed to
+        ``scanpy.pp.filter_genes`` as ``min_cells``.
+    min_genes : int, default 200
+        Keep cells that have at least ``min_genes`` detected genes. Passed to
+        ``scanpy.pp.filter_cells`` as ``min_genes``.
+
+    Returns
+    -------
+    anndata.AnnData
+        A new AnnData object with fixed dtypes and filtered cells/genes.
+
+    Notes
+    -----
+    - The function returns a fresh AnnData instance; the input object is not
+      modified in place.
+    - The dtype-fix step reconstructs ``X``, ``obs`` and ``var`` via a
+      ``pandas.DataFrame`` to coerce potential byte-string columns to proper
+      Python strings and to ensure consistent dtypes across columns.
+    """
+
+    def fix_dtypes(adata_):
+        df = pd.DataFrame(adata_.X.A, index=adata_.obs_names, columns=adata_.var_names)
+        df = df.join(adata_.obs)
+        return sc.AnnData(df[adata_.var_names], obs=df.drop(columns=adata_.var_names))
+
+    adata_ = fix_dtypes(adata_)
+    sc.pp.filter_genes(adata_, min_cells=min_cells)
+    sc.pp.filter_cells(adata_, min_genes=min_genes)
+    return adata_
+
 __all__ = [
     "DEFAULT_BUCKET",
     "download_data",
     "subset_adata",
     "subset_and_concat_folder",
     "write_subset_from_folder",
+    "prep_anndata"
 ]
