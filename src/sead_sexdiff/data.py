@@ -35,6 +35,9 @@ from botocore.client import Config
 import h5py
 import pandas as pd
 import scanpy as sc
+import numpy as np
+import random
+import decoupler as dc
 
 
 DEFAULT_BUCKET = "sea-ad-single-cell-profiling"
@@ -626,11 +629,87 @@ def prep_anndata(adata_, *, min_cells: int = 3, min_genes: int = 200):
     sc.pp.filter_cells(adata_, min_genes=min_genes)
     return adata_
 
+
+def pseudobulk_and_filter(
+    adata,
+    *,
+    sample_col: str = "Donor ID",
+    groups_col: str = "Supertype",
+    mode: str = "sum",
+    layer: str | None = "UMIs",
+    min_cells: int = 10,
+    min_counts: int = 1000,
+    pseudobulk_kwargs: dict | None = None,
+    filter_kwargs: dict | None = None,
+):
+    """Create pseudobulk profiles and filter low-quality samples using decoupler.
+
+    This helper wraps two decoupler preprocessing utilities in sequence:
+    1) ``dc.pp.pseudobulk`` to aggregate single-cell counts into sample/group
+       pseudobulk profiles.
+    2) ``dc.pp.filter_samples`` to filter out samples with too few cells or
+       total counts.
+
+    Parameters
+    ----------
+    adata : anndata.AnnData
+        Input single-cell AnnData object.
+    sample_col : str, default "Donor ID"
+        Column in ``adata.obs`` identifying the sample (e.g., donor ID).
+    groups_col : str, default "Supertype"
+        Column in ``adata.obs`` defining the biological group/cluster to
+        aggregate within (e.g., cell type).
+    mode : str, default "sum"
+        Aggregation mode for ``dc.pp.pseudobulk`` (e.g., "sum", "mean").
+    layer : str | None, default "UMIs"
+        Name of the layer to use for counts. If ``None``, use ``adata.X``.
+    min_cells : int, default 10
+        Minimum number of cells required per sample/group to keep in
+        ``dc.pp.filter_samples``.
+    min_counts : int, default 1000
+        Minimum total counts required per sample/group to keep in
+        ``dc.pp.filter_samples``.
+    pseudobulk_kwargs : dict | None, optional
+        Extra keyword arguments forwarded to ``dc.pp.pseudobulk``.
+    filter_kwargs : dict | None, optional
+        Extra keyword arguments forwarded to ``dc.pp.filter_samples``.
+
+    Returns
+    -------
+    anndata.AnnData
+        The pseudobulk AnnData after filtering.
+
+    Notes
+    -----
+    - Requires the ``decoupler`` package to be installed and importable as
+      ``decoupler``.
+    """
+
+    pb_kwargs = dict(
+        adata=adata,
+        sample_col=sample_col,
+        groups_col=groups_col,
+        mode=mode,
+        layer=layer,
+    )
+    if pseudobulk_kwargs:
+        pb_kwargs.update(pseudobulk_kwargs)
+
+    pdata = dc.pp.pseudobulk(**pb_kwargs)
+
+    fs_kwargs = dict(min_cells=min_cells, min_counts=min_counts)
+    if filter_kwargs:
+        fs_kwargs.update(filter_kwargs)
+
+    dc.pp.filter_samples(pdata, **fs_kwargs)
+    return pdata
+
 __all__ = [
     "DEFAULT_BUCKET",
     "download_data",
     "subset_adata",
     "subset_and_concat_folder",
     "write_subset_from_folder",
-    "prep_anndata"
+    "prep_anndata",
+    "pseudobulk_and_filter",
 ]
