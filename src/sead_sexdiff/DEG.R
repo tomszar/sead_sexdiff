@@ -1,3 +1,9 @@
+library(SingleCellExperiment)
+library(anndataR)
+library(MAST)
+
+sce_obj <- read_h5ad("results/cleaned_files/microglia_subset.h5ad", as = "SingleCellExperiment")
+
 find_de_MAST_RE <- function(adata_){
     # create a MAST object
     sca <- SceToSingleCellAssay(adata_, class = "SingleCellAssay")
