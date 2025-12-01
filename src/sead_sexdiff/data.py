@@ -710,6 +710,5 @@ __all__ = [
     "subset_adata",
     "subset_and_concat_folder",
     "write_subset_from_folder",
-    "prep_anndata",
-    "pseudobulk_and_filter",
+    "prep_anndata"
 ]
