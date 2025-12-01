@@ -711,5 +711,5 @@ __all__ = [
     "subset_and_concat_folder",
     "write_subset_from_folder",
     "prep_anndata",
-    "pseudobulk_and_filter"
+    "pseudobulk_and_filter",
 ]
