@@ -10,7 +10,12 @@ import argparse
 from pathlib import Path
 from typing import Iterable, List
 
-from .data import download_data, DEFAULT_BUCKET, write_subset_from_folder
+from .data import (
+    download_data,
+    DEFAULT_BUCKET,
+    write_subset_from_folder,
+    pseudobulk_and_filter,
+)
 
 
 def _parse_suffixes(values: list[str] | None) -> list[str] | None:
@@ -169,6 +174,20 @@ def main(argv: list[str] | None = None) -> int:
             compression=compression,
         )
         print(out_path)
+
+        # Also compute and save pseudobulk from the produced subset
+        try:
+            import anndata as ad  # local import to avoid hard dependency in non-subset commands
+
+            subset_adata = ad.read_h5ad(str(out_path))
+            pdata = pseudobulk_and_filter(subset_adata)
+
+            pseudobulk_path = Path(args.out_dir) / "microglia_pseudobulk.h5ad"
+            pdata.write(str(pseudobulk_path), compression=compression)
+            print(pseudobulk_path)
+        except Exception as e:
+            # Surface a clear error while keeping CLI behavior explicit
+            raise RuntimeError(f"Failed to create/save pseudobulk: {e}")
         return 0
 
     parser.error("Unknown command")

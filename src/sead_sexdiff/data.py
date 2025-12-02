@@ -351,9 +351,10 @@ def subset_and_concat_folder(
 ):
     """Create a concatenated subset from all H5AD files in a folder.
 
-    Iterates through files, subsetting by ``Subclass == subclass_label`` for
-    each file, concatenating them into a single AnnData while aggressively
-    freeing intermediate objects to minimize memory usage.
+    Iterates through files, subsetting by ``Subclass == subclass_label`` and
+    additionally excluding samples where ``obs["Overall AD neuropathological Change"] == "Reference"``
+    for each file. Concatenates the per-file subsets into a single AnnData while
+    aggressively freeing intermediate objects to minimize memory usage.
 
     Parameters
     ----------
@@ -370,7 +371,9 @@ def subset_and_concat_folder(
     Returns
     -------
     anndata.AnnData
-        Concatenation of per-file subsets.
+        Concatenation of per-file subsets after applying both filters:
+        1) ``obs['Subclass'] == subclass_label`` and
+        2) ``obs['Overall AD neuropathological Change'] != 'Reference'``.
     """
     import gc
     from typing import Iterable as _Iter
@@ -389,6 +392,18 @@ def subset_and_concat_folder(
     result: ad.AnnData | None = None
     for fp in files:
         subset = subset_adata(fp, subclass_label=subclass_label)
+        # Apply additional subsetting condition
+        if "Overall AD neuropathological Change" not in subset.obs:
+            try:
+                del subset
+            finally:
+                gc.collect()
+            raise KeyError(
+                "Column 'Overall AD neuropathological Change' not found in adata.obs"
+            )
+        subset = subset[
+            subset.obs["Overall AD neuropathological Change"] != "Reference"
+        ].copy()
         if result is None:
             result = subset
         else:

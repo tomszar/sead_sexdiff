@@ -75,9 +75,12 @@ sead-sexdiff download --dest-root ./data --bucket sea-ad-single-cell-profiling
 
 The command prints the local paths of files it downloaded. It uses anonymous S3 access for the public SEA-AD bucket and always attempts to fetch `Changelog.html` under the chosen prefix.
 
-### New: Subset donor AnnData files and write a single output (CLI)
+### New: Subset donor AnnData files and also write pseudobulk (CLI)
 
-Use the `subset` command to load each donor `.h5ad` in a folder, filter by a subclass label (default: `Microglia-PVM`), concatenate them, and write a single compressed `.h5ad` file.
+Use the `subset` command to load each donor `.h5ad` in a folder, filter by a subclass label (default: `Microglia-PVM`), concatenate them, and write outputs to disk:
+
+- Concatenated subset: `results/cleaned_files/<out_name>` (default `microglia_subset.h5ad`)
+- Pseudobulk AnnData: `results/cleaned_files/microglia_pseudobulk.h5ad`
 
 ```
 sead-sexdiff subset \
@@ -90,6 +93,7 @@ sead-sexdiff subset \
 
 - Disable compression if desired: `sead-sexdiff subset --compression none`
 - Memory: files are processed one-by-one; intermediates are freed to keep memory usage low.
+- Pseudobulk details: created via `decoupler` using defaults (`sample_col='Donor ID'`, `groups_col='Supertype'`, `mode='sum'`, `layer='UMIs'`, `min_cells=10`, `min_counts=1000`). If this step fails (e.g., missing dependency), the CLI raises a clear error.
 
 ### Python API examples
 

@@ -25,6 +25,7 @@ dependencies = [
   "pandas-stubs==2.3.3.251201",
   "rpy2>=3.6.4",
   "decoupler>=2.1.2",
+  "pydeseq2>=0.5.3",
 ]
 
 [project.scripts]
