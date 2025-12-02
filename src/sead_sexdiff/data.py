@@ -38,6 +38,9 @@ import scanpy as sc
 import numpy as np
 import random
 import decoupler as dc
+import anndata as ad
+from pydeseq2.dds import DeseqDataSet
+from pydeseq2.ds import DeseqStats
 
 
 DEFAULT_BUCKET = "sea-ad-single-cell-profiling"
@@ -423,40 +426,123 @@ def subset_and_concat_folder(
 def write_subset_from_folder(
     folder: str | Path = "data/PFC/RNAseq/donor_objects",
     *,
-    subclass_label: str = "Microglia-PVM",
+    subclass_label: str | None = None,
     out_dir: str | Path = "results/cleaned_files",
-    out_name: str = "microglia_subset.h5ad",
+    out_name: str | None = None,
     compression: str | None = "gzip",
-) -> Path:
-    """High-level helper: subset all files in ``folder`` and write one H5AD.
+) -> Path | list[Path]:
+    """High-level helper: subset donor files and write H5AD outputs.
 
     Parameters
     ----------
     folder:
         Input folder with donor ``.h5ad`` objects.
     subclass_label:
-        Subclass value used for filtering; defaults to "Microglia-PVM".
+        Subclass value used for filtering. If ``None`` (default), create one
+        subset file per unique value in ``adata.obs['Subclass']`` across the
+        input donor files.
     out_dir:
         Output directory where the single concatenated file will be written.
     out_name:
-        Filename for the output (default: "microglia_subset.h5ad").
+        Output filename. Used only when ``subclass_label`` is provided. If not
+        provided, a filename based on the subclass label will be generated
+        automatically (e.g., ``Microglia-PVM_subset.h5ad``). Ignored when
+        ``subclass_label`` is ``None``.
     compression:
         Compression passed to ``AnnData.write`` (e.g., "gzip").
 
     Returns
     -------
-    pathlib.Path
-        The path to the written file.
+    pathlib.Path | list[pathlib.Path]
+        Path to the written file when a single ``subclass_label`` is provided,
+        or a list of paths when processing all subclasses.
     """
     import anndata as ad  # only for typing/IDE hints; actual write uses the object
+    from collections import OrderedDict
+
+    def _sanitize(name: str) -> str:
+        # Simple filename sanitizer: keep alphanum, dash, underscore; replace others with '_'
+        import re
+
+        name = name.strip()
+        name = re.sub(r"\s+", "_", name)
+        name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+        # collapse multiple underscores
+        name = re.sub(r"_+", "_", name)
+        return name
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / out_name
+    
+    # If a specific subclass is requested, process and write a single file
+    if subclass_label is not None:
+        label = str(subclass_label)
+        auto_name = f"{_sanitize(label)}_subset.h5ad"
+        out_path = out_dir / (out_name or auto_name)
 
-    adata_concat = subset_and_concat_folder(folder, subclass_label=subclass_label)
-    adata_concat.write(str(out_path), compression=compression)
-    return out_path
+        adata_concat = subset_and_concat_folder(folder, subclass_label=label)
+
+        # Rename obs column before writing if present
+        try:
+            if "Overall AD neuropathological Change" in adata_concat.obs.columns:
+                adata_concat.obs.rename(
+                    columns={"Overall AD neuropathological Change": "ADNC"},
+                    inplace=True,
+                )
+        except Exception:
+            # Non-fatal; continue to write
+            pass
+
+        adata_concat.write(str(out_path), compression=compression)
+        return out_path
+
+    # Otherwise, discover all subclasses and write one file per subclass
+    # Use lightweight reader to avoid loading matrices
+    folder = Path(folder)
+    files = sorted([p for p in folder.glob("*.h5ad") if p.is_file()])
+    if not files:
+        raise FileNotFoundError(f"No files matching '*.h5ad' in {folder}")
+
+    # Ordered unique subclasses for deterministic writing order
+    subclasses_od: OrderedDict[str, None] = OrderedDict()
+    for fp in files:
+        try:
+            meta = custom_read_h5ad(fp)
+            obs = meta.get("obs")
+            if obs is None or "Subclass" not in obs.columns:
+                continue
+            for val in pd.unique(obs["Subclass"].astype(str)):
+                subclasses_od.setdefault(val, None)
+        except Exception:
+            # Skip problematic files, continue
+            continue
+
+    if not subclasses_od:
+        raise RuntimeError("No subclasses found across input files.")
+
+    written: list[Path] = []
+    for label in subclasses_od.keys():
+        try:
+            adata_concat = subset_and_concat_folder(folder, subclass_label=label)
+            try:
+                if "Overall AD neuropathological Change" in adata_concat.obs.columns:
+                    adata_concat.obs.rename(
+                        columns={"Overall AD neuropathological Change": "ADNC"},
+                        inplace=True,
+                    )
+            except Exception:
+                pass
+            fname = f"{_sanitize(label)}_subset.h5ad"
+            out_path = out_dir / fname
+            adata_concat.write(str(out_path), compression=compression)
+            written.append(out_path)
+        except Exception:
+            # Continue with next subclass if one fails
+            continue
+
+    if not written:
+        raise RuntimeError("Failed to create any subclass subset files.")
+    return written
 
 
 def custom_read_h5ad(filename):
@@ -719,6 +805,136 @@ def pseudobulk_and_filter(
     dc.pp.filter_samples(pdata, **fs_kwargs)
     return pdata
 
+
+def differential_expression(
+    pseudobulk_file: str | Path = "results/cleaned_files/microglia_pseudobulk.h5ad",
+    *,
+    supertype: str | None = None,
+    results_dir: str | Path = "results/DE",
+    contrast: np.ndarray | list[float] | tuple[float, ...] = (
+        0, 0, 0, 0, 0, 0, 0, 1
+    ),
+):
+    """Run DESeq2 differential expression on pseudobulked data.
+
+    Steps:
+    - Load pseudobulk AnnData file.
+    - For each category in ``obs.Supertype`` (or a specific one if provided),
+      create a ``DeseqDataSet`` with design ``~Sex + ADNC + Sex:ADNC``.
+    - Fit the model, compute statistics for a single contrast, and summarize.
+    - Save a results table and a volcano plot per supertype.
+
+    Parameters
+    ----------
+    pseudobulk_file : str | Path
+        Path to the pseudobulk AnnData file (``.h5ad``).
+    supertype : str | None
+        If provided, limit the analysis to this value in ``obs.Supertype``.
+        If ``None``, run for all supertypes present in the data.
+    results_dir : str | Path, default "results/DE"
+        Directory to write results into. A CSV and a PDF are produced per
+        supertype as ``<Supertype>_deseq2_results.csv`` and
+        ``<Supertype>_volcano.pdf``.
+    contrast : array-like of float, default (0,0,0,0,0,0,0,1)
+        Contrast vector passed to ``pydeseq2.DeseqStats``. Provide a sequence
+        of numbers matching your design matrix. Defaults to the requested
+        vector with the interaction term.
+
+    Behavior on non full-rank design
+    --------------------------------
+    If ``pydeseq2`` emits a ``UserWarning`` stating that "The design matrix is
+    not full rank, so the model cannot be fitted", this function skips that
+    supertype and proceeds to the next one without writing outputs for it.
+
+    Returns
+    -------
+    dict[str, dict[str, Path]]
+        Mapping of ``supertype`` to a dict with keys ``results_csv`` and
+        ``volcano_pdf``.
+    """
+
+    pseudobulk_file = Path(pseudobulk_file)
+    results_dir = Path(results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load pseudobulk AnnData
+    pdata = ad.read_h5ad(str(pseudobulk_file))
+
+    # Validate columns
+    if "Supertype" not in pdata.obs.columns:
+        raise KeyError("Column 'Supertype' not found in pseudobulk.obs")
+    for col in ("Sex", "ADNC"):
+        if col not in pdata.obs.columns:
+            raise KeyError(f"Column '{col}' not found in pseudobulk.obs")
+
+    # Determine supertypes to process
+    if supertype is None:
+        supertypes = pd.Index(sorted(pd.unique(pdata.obs["Supertype"].astype(str))))
+    else:
+        supertypes = pd.Index([supertype])
+
+    outputs: dict[str, dict[str, Path]] = {}
+
+    for st in supertypes:
+        st_mask = pdata.obs["Supertype"].astype(str) == st
+        micro_pdata = pdata[st_mask].copy()
+        if micro_pdata.n_obs == 0:
+            # Skip empty groups (in case of mismatched dtype)
+            continue
+
+        # Ensure categorical covariates are strings/categorical
+        for col in ("Sex", "ADNC"):
+            # Convert bytes to str if any
+            if micro_pdata.obs[col].dtype == object:
+                micro_pdata.obs[col] = micro_pdata.obs[col].apply(
+                    lambda x: x.decode() if isinstance(x, (bytes, bytearray)) else x
+                )
+            micro_pdata.obs[col] = micro_pdata.obs[col].astype("category")
+
+        # Create DESeq2 dataset and fit
+        # If pydeseq2 emits a UserWarning that the design matrix is not full rank,
+        # skip this supertype and continue with the next one.
+        import warnings
+
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "error",
+                    message=r"The design matrix is not full rank, so the model cannot be fitted.*",
+                    category=UserWarning,
+                )
+                dds = DeseqDataSet(adata=micro_pdata, design="~Sex + ADNC + Sex:ADNC")
+                # Some versions could defer the check to deseq2(); keep the same guard
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "error",
+                        message=r"The design matrix is not full rank, so the model cannot be fitted.*",
+                        category=UserWarning,
+                    )
+                    dds.deseq2()
+        except UserWarning as uw:  # design matrix not full rank
+            print(
+                f"[de] Skipping supertype '{st}' due to non-full-rank design: {uw}")
+            continue
+
+        # Use provided contrast vector
+        contrast_vec = np.array(contrast, dtype=float)
+        ds = DeseqStats(dds, contrast=contrast_vec)
+        ds.summary()
+
+        # Save results table
+        safe_super = str(st).replace("/", "-")
+        out_csv = results_dir / f"{safe_super}_deseq2_results.csv"
+        ds.results_df.to_csv(out_csv, index=True)
+
+        # Volcano plot per supertype with name including supertype
+        volcano_pdf = results_dir / f"{safe_super}_volcano.pdf"
+        dc.pl.volcano(ds.results_df, x="log2FoldChange", y="pvalue", save=str(volcano_pdf))
+
+        outputs[str(st)] = {"results_csv": out_csv, "volcano_pdf": volcano_pdf}
+
+    return outputs
+
 __all__ = [
     "DEFAULT_BUCKET",
     "download_data",
@@ -727,4 +943,5 @@ __all__ = [
     "write_subset_from_folder",
     "prep_anndata",
     "pseudobulk_and_filter",
+    "differential_expression",
 ]

@@ -15,6 +15,7 @@ from .data import (
     DEFAULT_BUCKET,
     write_subset_from_folder,
     pseudobulk_and_filter,
+    differential_expression,
 )
 
 
@@ -35,6 +36,22 @@ def _parse_suffixes(values: list[str] | None) -> list[str] | None:
         parts = [p.strip() for p in v.split(",") if p.strip()]
         out.extend(parts)
     return out or None
+
+
+def _parse_floats_csv(value: str | None) -> list[float] | None:
+    """Parse a comma- or space-separated string of numbers into a list of floats.
+
+    Returns None if the input is falsy.
+    """
+    if not value:
+        return None
+    parts = []
+    # Allow commas and/or whitespace
+    for token in value.replace(",", " ").split():
+        if not token:
+            continue
+        parts.append(float(token))
+    return parts or None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -118,9 +135,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub_subset.add_argument(
         "--subclass-label",
-        default="Microglia-PVM",
+        default=None,
         help=(
-            "Value to match in adata.obs['Subclass'] (default: %(default)s)"
+            "Value to match in adata.obs['Subclass']. If omitted, a subset file "
+            "is produced for EACH Subclass present across the input files."
         ),
     )
     sub_subset.add_argument(
@@ -131,8 +149,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub_subset.add_argument(
         "--out-name",
-        default="microglia_subset.h5ad",
-        help="Output filename (default: %(default)s)",
+        default=None,
+        help=(
+            "Output filename (used only when --subclass-label is provided). "
+            "If omitted, the filename is inferred from the subclass label "
+            "(e.g., 'Microglia-PVM_subset.h5ad'). Ignored when producing all subclasses."
+        ),
     )
     sub_subset.add_argument(
         "--compression",
@@ -140,6 +162,48 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Compression for AnnData.write (e.g., gzip). Use 'none' to disable "
             "compression. (default: %(default)s)"
+        ),
+    )
+
+    # differential expression command
+    sub_de = sub.add_parser(
+        "de",
+        help="Run differential expression with pydeseq2 on pseudobulk data",
+        description=(
+            "Load a pseudobulk .h5ad file and, by default, run DE for ALL supertypes. "
+            "Fits a DESeq2 model with design '~Sex + ADNC + Sex:ADNC', computes a "
+            "contrast, writes one results table and volcano plot per supertype."
+        ),
+    )
+    sub_de.add_argument(
+        "--pseudobulk-file",
+        default=Path("results/cleaned_files/microglia_pseudobulk.h5ad"),
+        type=Path,
+        help="Path to pseudobulk .h5ad file (default: %(default)s)",
+    )
+    sub_de.add_argument(
+        "--supertype",
+        default=None,
+        help=(
+            "Value in obs.Supertype to subset. If omitted, runs DE for ALL "
+            "supertypes present in the data."
+        ),
+    )
+    sub_de.add_argument(
+        "--results-dir",
+        default=Path("results/DE"),
+        type=Path,
+        help=(
+            "Directory to write outputs. A CSV and a volcano PDF are produced per "
+            "supertype (default: %(default)s)"
+        ),
+    )
+    sub_de.add_argument(
+        "--contrast",
+        default=None,
+        help=(
+            "Contrast vector as comma-separated numbers (e.g., '0,0,0,0,0,0,0,1'). "
+            "If omitted, the default contrast (0,0,0,0,0,0,0,1) is used."
         ),
     )
     return parser
@@ -166,28 +230,104 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "subset":
         compression = None if (str(args.compression).lower() in {"none", "no", "false", "0"}) else args.compression
-        out_path = write_subset_from_folder(
+
+        print("[subset] Starting subset and concatenate step...")
+        print(f"[subset] Folder: {args.folder}")
+        print(f"[subset] Subclass label: {args.subclass_label if args.subclass_label is not None else 'ALL (one file per Subclass)'}")
+        print(f"[subset] Output directory: {args.out_dir}")
+        if args.subclass_label is not None:
+            print(f"[subset] Output name: {args.out_name or '(auto from subclass)'}")
+        else:
+            print("[subset] Output name: (auto: '<Subclass>_subset.h5ad' per subclass)")
+        print(f"[subset] Compression: {compression or 'none'}")
+        print("[subset] Building concatenated subset (this may take a while)...")
+        out_paths = write_subset_from_folder(
             folder=args.folder,
             subclass_label=args.subclass_label,
             out_dir=args.out_dir,
             out_name=args.out_name,
             compression=compression,
         )
-        print(out_path)
+        if isinstance(out_paths, list):
+            print("[subset] Wrote the following subset files:")
+            for p in out_paths:
+                print(f"  - {p}")
+            print("[subset] Note: Renaming obs column 'Overall AD neuropathological Change' to 'ADNC' is applied before writing when present.")
+        else:
+            print(f"[subset] Wrote subset file to: {out_paths}")
+            print("[subset] Note: Renaming obs column 'Overall AD neuropathological Change' to 'ADNC' is applied before writing when present.")
 
-        # Also compute and save pseudobulk from the produced subset
-        try:
+        # Helper to compute and write pseudobulk for a single subset file path
+        def _compute_and_write_pseudobulk(subset_file: Path) -> Path:
             import anndata as ad  # local import to avoid hard dependency in non-subset commands
 
-            subset_adata = ad.read_h5ad(str(out_path))
+            print(f"[subset] Loading subset for pseudobulk: {subset_file}")
+            subset_adata = ad.read_h5ad(str(subset_file))
+            print("[subset] Computing pseudobulk and filtering...")
             pdata = pseudobulk_and_filter(subset_adata)
 
-            pseudobulk_path = Path(args.out_dir) / "microglia_pseudobulk.h5ad"
+            stem = Path(subset_file).stem
+            if stem.endswith("_subset"):
+                stem = stem[:-len("_subset")]
+            pseudobulk_path = Path(args.out_dir) / f"{stem}_pseudobulk.h5ad"
+            print(f"[subset] Writing pseudobulk to: {pseudobulk_path}")
             pdata.write(str(pseudobulk_path), compression=compression)
-            print(pseudobulk_path)
-        except Exception as e:
-            # Surface a clear error while keeping CLI behavior explicit
-            raise RuntimeError(f"Failed to create/save pseudobulk: {e}")
+            return pseudobulk_path
+
+        # Compute and save pseudobulk(s)
+        if isinstance(out_paths, list):
+            print("[subset] Creating pseudobulk for each subclass subset...")
+            failures: list[tuple[Path, Exception]] = []
+            produced: list[Path] = []
+            for p in out_paths:
+                try:
+                    pseudobulk_p = _compute_and_write_pseudobulk(Path(p))
+                    produced.append(pseudobulk_p)
+                except Exception as e:
+                    failures.append((Path(p), e))
+            if produced:
+                print("[subset] Wrote the following pseudobulk files:")
+                for pp in produced:
+                    print(f"  - {pp}")
+            if failures:
+                print("[subset] WARNING: Failed to create pseudobulk for some subsets:")
+                for p, e in failures:
+                    print(f"  - {p}: {e}")
+        else:
+            try:
+                pseudobulk_path = _compute_and_write_pseudobulk(Path(out_paths))
+                print("[subset] Done.")
+            except Exception as e:
+                # Surface a clear error while keeping CLI behavior explicit
+                raise RuntimeError(f"Failed to create/save pseudobulk: {e}")
+        return 0
+
+    if args.command == "de":
+        print("[de] Running differential expression analysis...")
+        contrast_list = _parse_floats_csv(args.contrast)
+        if contrast_list is None:
+            outputs = differential_expression(
+                pseudobulk_file=args.pseudobulk_file,
+                supertype=args.supertype,
+                results_dir=args.results_dir,
+            )
+        else:
+            outputs = differential_expression(
+                pseudobulk_file=args.pseudobulk_file,
+                supertype=args.supertype,
+                results_dir=args.results_dir,
+                contrast=contrast_list,
+            )
+        if isinstance(outputs, dict):
+            # Print a line per supertype
+            for st, paths in outputs.items():
+                csv_p = paths.get("results_csv")
+                pdf_p = paths.get("volcano_pdf")
+                if csv_p:
+                    print(f"[de] {st} results: {csv_p}")
+                if pdf_p:
+                    print(f"[de] {st} volcano: {pdf_p}")
+        print("[de] Done.")
         return 0
 
     parser.error("Unknown command")

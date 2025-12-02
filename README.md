@@ -75,12 +75,17 @@ sead-sexdiff download --dest-root ./data --bucket sea-ad-single-cell-profiling
 
 The command prints the local paths of files it downloaded. It uses anonymous S3 access for the public SEA-AD bucket and always attempts to fetch `Changelog.html` under the chosen prefix.
 
-### New: Subset donor AnnData files and also write pseudobulk (CLI)
+### New: Subset donor AnnData files and write pseudobulk(s) (CLI)
 
-Use the `subset` command to load each donor `.h5ad` in a folder, filter by a subclass label (default: `Microglia-PVM`), concatenate them, and write outputs to disk:
+Use the `subset` command to load each donor `.h5ad` in a folder, filter by subclass, concatenate, and write outputs to disk.
 
-- Concatenated subset: `results/cleaned_files/<out_name>` (default `microglia_subset.h5ad`)
-- Pseudobulk AnnData: `results/cleaned_files/microglia_pseudobulk.h5ad`
+- Single-subclass mode (when `--subclass-label` is provided):
+  - Concatenated subset: `results/cleaned_files/<Subclass>_subset.h5ad` by default, or the value of `--out-name` if given.
+  - Pseudobulk AnnData is also written automatically as `results/cleaned_files/<Subclass>_pseudobulk.h5ad`.
+
+- ALL-subclasses mode (default when `--subclass-label` is omitted):
+  - One concatenated subset file per unique `obs['Subclass']`, named `results/cleaned_files/<Subclass>_subset.h5ad`.
+  - One pseudobulk per subset is also generated, named `results/cleaned_files/<Subclass>_pseudobulk.h5ad`.
 
 ```
 sead-sexdiff subset \
@@ -93,7 +98,57 @@ sead-sexdiff subset \
 
 - Disable compression if desired: `sead-sexdiff subset --compression none`
 - Memory: files are processed one-by-one; intermediates are freed to keep memory usage low.
-- Pseudobulk details: created via `decoupler` using defaults (`sample_col='Donor ID'`, `groups_col='Supertype'`, `mode='sum'`, `layer='UMIs'`, `min_cells=10`, `min_counts=1000`). If this step fails (e.g., missing dependency), the CLI raises a clear error.
+- Pseudobulk details: created via `decoupler` using defaults (`sample_col='Donor ID'`, `groups_col='Supertype'`, `mode='sum'`, `layer='UMIs'`, `min_cells=10`, `min_counts=1000`). If this step fails (e.g., missing dependency), the CLI raises a clear error. In ALL-subclasses mode, pseudobulk computation runs once per produced subset file.
+
+### New: Differential expression (CLI)
+
+Run DESeq2 differential expression on the pseudobulk file using design `~Sex + ADNC + Sex:ADNC`.
+
+- By default, the command runs DE for ALL supertypes found in `obs.Supertype`.
+- Outputs are written to `results/DE`, one CSV and one volcano plot per supertype.
+
+Basic usage (runs all supertypes):
+
+```
+sead-sexdiff de
+```
+
+Options:
+
+- `--pseudobulk-file`: path to the pseudobulk `.h5ad` (default: `results/cleaned_files/microglia_pseudobulk.h5ad`)
+- `--supertype`: value in `obs.Supertype` to subset. If omitted, runs DE for ALL supertypes.
+- `--results-dir`: output directory for per-supertype results (default: `results/DE`)
+- `--contrast`: contrast vector as comma- or space-separated numbers. If omitted, the default `(0,0,0,0,0,0,0,1)` is used.
+
+Examples:
+
+- Run all supertypes to `results/DE`:
+
+```
+sead-sexdiff de
+```
+
+- Limit to a single Supertype and customize contrast:
+
+```
+sead-sexdiff de \
+  --pseudobulk-file results/cleaned_files/microglia_pseudobulk.h5ad \
+  --supertype Micro-PVM_2 \
+  --results-dir results/DE \
+  --contrast 0,0,0,0,0,0,0,1
+```
+
+Outputs (per supertype, with `/` in names replaced by `-`):
+
+- Results table CSV: `results/DE/<Supertype>_deseq2_results.csv`
+- Volcano plot PDF: `results/DE/<Supertype>_volcano.pdf`
+
+Notes:
+
+- If the DESeq2 design matrix is not full rank for a given supertype (pydeseq2
+  emits a UserWarning that the model cannot be fitted), that supertype is
+  skipped and no outputs are written for it. The analysis proceeds with the
+  remaining supertypes.
 
 ### Python API examples
 
