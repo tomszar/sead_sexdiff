@@ -77,7 +77,7 @@ The command prints the local paths of files it downloaded. It uses anonymous S3 
 
 ### New: Subset donor AnnData files and write pseudobulk(s) (CLI)
 
-Use the `subset` command to load each donor `.h5ad` in a folder, filter by subclass, concatenate, and write outputs to disk.
+Use the `subset` command to load each donor `.h5ad` in a folder, filter by subclass, apply rudimentary QC, concatenate, and write outputs to disk.
 
 - Single-subclass mode (when `--subclass-label` is provided):
   - Concatenated subset: `results/cleaned_files/<Subclass>_subset.h5ad` by default, or the value of `--out-name` if given.
@@ -98,6 +98,9 @@ sead-sexdiff subset \
 
 - Disable compression if desired: `sead-sexdiff subset --compression none`
 - Memory: files are processed one-by-one; intermediates are freed to keep memory usage low.
+- QC: when reading each donor object, two basic filters are applied before concatenation:
+  - filter cells with too few detected genes: `sc.pp.filter_cells(adata, min_genes=200)`
+  - filter genes detected in very few cells: `sc.pp.filter_genes(adata, min_cells=3)`
 - Pseudobulk details: created via `decoupler` using defaults (`sample_col='Donor ID'`, `groups_col='Supertype'`, `mode='sum'`, `layer='UMIs'`, `min_cells=10`, `min_counts=1000`). If this step fails (e.g., missing dependency), the CLI raises a clear error. In ALL-subclasses mode, pseudobulk computation runs once per produced subset file.
 
 ### New: Differential expression (CLI)
@@ -175,6 +178,8 @@ adata_sub = subset_adata(
     subclass_label="Microglia-PVM",
 )
 ```
+
+Note: `subset_adata` applies the same rudimentary QC by default (cells `min_genes=200`, genes `min_cells=3`).
 
 - Subset every donor file in a folder and concatenate them:
 

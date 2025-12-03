@@ -309,6 +309,11 @@ def download_data(
 def subset_adata(file_path: str | Path, *, subclass_label: str = "Microglia-PVM"):
     """Read an AnnData H5AD file and return a subset by ``obs['Subclass']``.
 
+    In addition to subsetting by ``Subclass == subclass_label``, this function
+    applies two rudimentary QC filters to the per-donor object before returning:
+    - Filter cells with too few detected genes: ``sc.pp.filter_cells(adata, min_genes=200)``
+    - Filter genes detected in very few cells: ``sc.pp.filter_genes(adata, min_cells=3)``
+
     Parameters
     ----------
     file_path:
@@ -320,12 +325,13 @@ def subset_adata(file_path: str | Path, *, subclass_label: str = "Microglia-PVM"
     Returns
     -------
     anndata.AnnData
-        The subset ``AnnData`` object. The original loaded object is deleted
-        to free memory before returning.
+        The subset ``AnnData`` object after the basic QC filters above. The
+        original loaded object is deleted to free memory before returning.
     """
     # Import locally to avoid heavy import on module import
     import gc
     import anndata as ad
+    import scanpy as sc
 
     file_path = Path(file_path)
     adata = ad.read_h5ad(str(file_path))
@@ -337,6 +343,12 @@ def subset_adata(file_path: str | Path, *, subclass_label: str = "Microglia-PVM"
         raise KeyError("Column 'Subclass' not found in adata.obs")
 
     subset = adata[adata.obs["Subclass"] == subclass_label].copy()
+
+    # Apply basic QC on the per-donor subset
+    # 1) filter cells by detected genes
+    sc.pp.filter_cells(subset, min_genes=200)
+    # 2) filter genes by number of cells
+    sc.pp.filter_genes(subset, min_cells=3)
     # Drop the original to free memory
     try:
         del adata
