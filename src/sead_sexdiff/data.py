@@ -28,6 +28,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Iterable, List
+import json
 
 import boto3
 from botocore import UNSIGNED
@@ -405,7 +406,7 @@ def subset_and_concat_folder(
             )
         subset = subset[
             subset.obs["Overall AD neuropathological Change"] != "Reference"
-        ].copy()
+        ]
         if result is None:
             result = subset
         else:
@@ -428,7 +429,7 @@ def write_subset_from_folder(
     subclass_label: str | None = None,
     out_dir: str | Path = "results/cleaned_files",
     out_name: str | None = None,
-    compression: str | None = "gzip",
+    compression: str | None = "lzf",
 ) -> Path | list[Path]:
     """High-level helper: subset donor files and write H5AD outputs.
 
@@ -493,28 +494,113 @@ def write_subset_from_folder(
             pass
 
         adata_concat.write(str(out_path), compression=compression)
+
+        # Immediately create and write pseudobulk, then free memory
+        try:
+            pdata = pseudobulk_and_filter(adata_concat)
+            stem = out_path.stem
+            if stem.endswith("_subset"):
+                stem = stem[: -len("_subset")]
+            pseudobulk_path = out_dir / f"{stem}_pseudobulk.h5ad"
+            pdata.write(str(pseudobulk_path), compression=compression)
+        finally:
+            # Ensure we free large objects aggressively
+            try:
+                del pdata
+            except Exception:
+                pass
+            try:
+                del adata_concat
+            except Exception:
+                pass
+            import gc as _gc
+            _gc.collect()
         return out_path
 
     # Otherwise, discover all subclasses and write one file per subclass
-    # Use lightweight reader to avoid loading matrices
+    # Use lightweight reader to avoid loading matrices and cache discovery
     folder = Path(folder)
     files = sorted([p for p in folder.glob("*.h5ad") if p.is_file()])
     if not files:
         raise FileNotFoundError(f"No files matching '*.h5ad' in {folder}")
 
+    # Cache path (under output directory) for subclass discovery
+    cache_path = out_dir / ".subclass_index.json"
+
+    def _stat_for(p: Path) -> dict:
+        try:
+            st = p.stat()
+            return {"size": int(st.st_size), "mtime": float(st.st_mtime)}
+        except Exception:
+            return {"size": None, "mtime": None}
+
+    cached_index: dict[str, dict] | None = None
+    if cache_path.exists():
+        try:
+            cached_index = json.loads(cache_path.read_text())
+        except Exception:
+            cached_index = None
+
+    # Determine if cache is valid for current files
+    cache_valid = False
+    if cached_index and isinstance(cached_index, dict):
+        files_map = cached_index.get("files") or {}
+        try:
+            cache_valid = all(
+                (
+                    str(fp) in files_map
+                    and files_map[str(fp)].get("size") == _stat_for(fp)["size"]
+                    and abs(files_map[str(fp)].get("mtime", 0.0) - _stat_for(fp)["mtime"]) < 1e-6
+                )
+                for fp in files
+            )
+        except Exception:
+            cache_valid = False
+
     # Ordered unique subclasses for deterministic writing order
     subclasses_od: OrderedDict[str, None] = OrderedDict()
-    for fp in files:
-        try:
-            meta = ad.read_h5ad(fp)
-            obs = meta.obs
-            if obs is None or "Subclass" not in obs.columns:
+    per_file_subclasses: dict[str, list[str]] = {}
+
+    if cache_valid:
+        # Rebuild ordered dict by iterating files in current order
+        for fp in files:
+            vals = cached_index["files"][str(fp)].get("subclasses") or []
+            vals = [str(v) for v in vals]
+            per_file_subclasses[str(fp)] = vals
+            for v in vals:
+                subclasses_od.setdefault(v, None)
+    else:
+        for fp in files:
+            try:
+                meta = ad.read_h5ad(fp, backed='r')
+                obs = meta.obs
+                del meta
+                vals: list[str] = []
+                if obs is not None and "Subclass" in obs.columns:
+                    for val in pd.unique(obs["Subclass"].astype(str)):
+                        subclasses_od.setdefault(str(val), None)
+                        vals.append(str(val))
+                per_file_subclasses[str(fp)] = vals
+            except Exception:
+                # Skip problematic files, continue
                 continue
-            for val in pd.unique(obs["Subclass"].astype(str)):
-                subclasses_od.setdefault(val, None)
+
+        # Write cache
+        try:
+            cache_payload = {
+                "files": {
+                    str(fp): {
+                        "size": _stat_for(fp)["size"],
+                        "mtime": _stat_for(fp)["mtime"],
+                        "subclasses": per_file_subclasses.get(str(fp), []),
+                    }
+                    for fp in files
+                }
+            }
+            cache_path.write_text(json.dumps(cache_payload, indent=2))
         except Exception:
-            # Skip problematic files, continue
-            continue
+            # Cache failures are non-fatal
+            pass
 
     if not subclasses_od:
         raise RuntimeError("No subclasses found across input files.")
@@ -522,6 +608,7 @@ def write_subset_from_folder(
     written: list[Path] = []
     for label in subclasses_od.keys():
         try:
+            print(label)
             adata_concat = subset_and_concat_folder(folder, subclass_label=label)
             try:
                 if "Overall AD neuropathological Change" in adata_concat.obs.columns:
@@ -538,6 +625,27 @@ def write_subset_from_folder(
         except Exception:
             # Continue with next subclass if one fails
             continue
+
+        # Immediately compute and write pseudobulk, then free memory
+        try:
+            pdata = pseudobulk_and_filter(adata_concat)
+            stem = out_path.stem
+            if stem.endswith("_subset"):
+                stem = stem[: -len("_subset")]
+            pseudobulk_path = out_dir / f"{stem}_pseudobulk.h5ad"
+            pdata.write(str(pseudobulk_path), compression=compression)
+        finally:
+            # Ensure we free large objects aggressively
+            try:
+                del pdata
+            except Exception:
+                pass
+            try:
+                del adata_concat
+            except Exception:
+                pass
+            import gc as _gc
+            _gc.collect()
 
     if not written:
         raise RuntimeError("Failed to create any subclass subset files.")

@@ -158,9 +158,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub_subset.add_argument(
         "--compression",
-        default="gzip",
+        default="lzf",
         help=(
-            "Compression for AnnData.write (e.g., gzip). Use 'none' to disable "
+            "Compression for AnnData.write (e.g., lzf, gzip). Use 'none' to disable "
             "compression. (default: %(default)s)"
         ),
     )
@@ -253,53 +253,11 @@ def main(argv: list[str] | None = None) -> int:
             for p in out_paths:
                 print(f"  - {p}")
             print("[subset] Note: Renaming obs column 'Overall AD neuropathological Change' to 'ADNC' is applied before writing when present.")
+            print("[subset] Pseudobulk files were generated alongside subset files.")
         else:
             print(f"[subset] Wrote subset file to: {out_paths}")
             print("[subset] Note: Renaming obs column 'Overall AD neuropathological Change' to 'ADNC' is applied before writing when present.")
-
-        # Helper to compute and write pseudobulk for a single subset file path
-        def _compute_and_write_pseudobulk(subset_file: Path) -> Path:
-            import anndata as ad  # local import to avoid hard dependency in non-subset commands
-
-            print(f"[subset] Loading subset for pseudobulk: {subset_file}")
-            subset_adata = ad.read_h5ad(str(subset_file))
-            print("[subset] Computing pseudobulk and filtering...")
-            pdata = pseudobulk_and_filter(subset_adata)
-
-            stem = Path(subset_file).stem
-            if stem.endswith("_subset"):
-                stem = stem[:-len("_subset")]
-            pseudobulk_path = Path(args.out_dir) / f"{stem}_pseudobulk.h5ad"
-            print(f"[subset] Writing pseudobulk to: {pseudobulk_path}")
-            pdata.write(str(pseudobulk_path), compression=compression)
-            return pseudobulk_path
-
-        # Compute and save pseudobulk(s)
-        if isinstance(out_paths, list):
-            print("[subset] Creating pseudobulk for each subclass subset...")
-            failures: list[tuple[Path, Exception]] = []
-            produced: list[Path] = []
-            for p in out_paths:
-                try:
-                    pseudobulk_p = _compute_and_write_pseudobulk(Path(p))
-                    produced.append(pseudobulk_p)
-                except Exception as e:
-                    failures.append((Path(p), e))
-            if produced:
-                print("[subset] Wrote the following pseudobulk files:")
-                for pp in produced:
-                    print(f"  - {pp}")
-            if failures:
-                print("[subset] WARNING: Failed to create pseudobulk for some subsets:")
-                for p, e in failures:
-                    print(f"  - {p}: {e}")
-        else:
-            try:
-                pseudobulk_path = _compute_and_write_pseudobulk(Path(out_paths))
-                print("[subset] Done.")
-            except Exception as e:
-                # Surface a clear error while keeping CLI behavior explicit
-                raise RuntimeError(f"Failed to create/save pseudobulk: {e}")
+            print("[subset] Pseudobulk file was generated alongside subset file.")
         return 0
 
     if args.command == "de":
